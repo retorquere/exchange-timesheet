@@ -1,0 +1,4 @@
+EWS_URL=https://weboffice.han.nl/ews/Exchange.asmx
+EWS_USER="yourid@han.nl"
+EWS_PASSWORD=verysecure
+TIMESHEET_ID=google-sheets-id

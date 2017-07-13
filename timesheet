@@ -1,0 +1,164 @@
+#!/usr/bin/env ruby
+
+require 'dotenv'
+require 'viewpoint'
+require 'date'
+require 'ostruct'
+require 'tzinfo'
+require 'google_drive'
+require 'json'
+require 'sqlite3'
+require 'hashie'
+
+Dotenv.load(File.join(File.dirname(__FILE__), '.env'))
+
+class Appointment
+  @@tz = TZInfo::Timezone.get('Europe/Amsterdam')
+  def initialize(appt, _start, _end, _allday = nil)
+    @appt = appt
+    @status ||= @appt.ews_item[:legacy_free_busy_status][:text].to_sym
+    @start = _start
+    @end = _end
+    @allday = _allday || appt.all_day?
+    @subject = @appt.subject
+
+    @categories = appt.categories || []
+
+    raise "Unknown status #{@status.inspect}" unless %I{Free OOF Busy Tentative}.include?(@status)
+  end
+  attr_reader :status, :start, :end, :allday, :categories, :subject
+end
+
+class Calendar
+  @@tz = TZInfo::Timezone.get('Europe/Amsterdam')
+  def initialize(start_date = nil)
+    @client = Viewpoint::EWSClient.new(ENV['EWS_URL'], ENV['EWS_USER'], ENV['EWS_PASSWORD'])
+    @calendar = @client.get_folder(:calendar)
+    
+    @start_date = start_date || (Date.today - 90)
+
+    case @start_date.wday
+      when 1 then # monday
+      when 0
+        @start_date += 1
+      else
+        @start_date -= (@start_date.wday - 1)
+    end
+  end
+
+  def each
+    calendar_view = {
+      max_entries_returned: 5000,
+      start_date: @start_date.to_time.iso8601,
+      end_date: Date.today.to_time.iso8601,
+    }
+    shallow_items = @calendar.items(item_shape: { base_shape: 'IdOnly' }, calendar_view: calendar_view)
+    item_ids = shallow_items.map(&:id)
+
+    # Must do a second GetItems call as FindItems is incapable of returning
+    # item:Body. Some details here: http://msdn.microsoft.com/en-us/library/office/gg236897(v=exchg.140).aspx
+    items = item_ids.any? ? @calendar.get_items(item_ids, { item_shape: { base_shape: 'AllProperties', body_type: 'Text' } }) : []
+    items.each{|item|
+      _start = @@tz.utc_to_local(item.start.to_time.utc)
+      _end = @@tz.utc_to_local(item.end.to_time.utc)
+
+      if _start.to_date == _end.to_date
+        yield Appointment.new(item, _start, _end)
+      elsif item.all_day? && ((_start.to_date + 1) == _end.to_date)
+        yield Appointment.new(item, _start, _end - 1)
+      else
+        daterange = (_start.to_date .. _end.to_date).to_a
+
+        daterange.each_with_index{|date, day|
+          if day == 0
+            day = :first
+          elsif day == (daterange.length - 1)
+            day = :last
+          end
+          next if day == :last && item.all_day? # exchange registers time as exclusive-end
+
+          yield Appointment.new(item,
+            (day == :first) ? _start : date.to_time,
+            (day == :last) ? _end : (date + 1).to_time - 1,
+            (day == :first || day == :last) ? nil : true
+          )
+        }
+      end
+    }
+  end
+end
+
+#db = SQLite3::Database.new(':memory:')
+db = SQLite3::Database.new('timesheet.sqlite')
+db.results_as_hash = true
+db.execute('drop table if exists timesheet')
+db.execute('create table timesheet ("date" not null, week not null, subject not null, project not null, hours not null)')
+
+monday = Date.today
+case monday.wday
+  when 1 then # pass
+  when 0
+    monday += 1
+  else
+    monday -= (monday.wday - 1)
+end
+Calendar.new.each{|appt|
+  next if appt.status == :Free
+  break if appt.start.to_date >= monday
+
+  raise "#{appt.start}: #{appt.subject} == #{appt.categories.inspect}" if appt.categories.length != 1
+
+  week = DateTime.new(appt.start.year, appt.start.month, appt.start.day)
+  week = Date.commercial(week.year, week.cweek, 1).strftime("%Y-%m-%d")
+  if appt.allday
+    hours = 8
+  else
+    hours = (appt.end - appt.start) / 3600.0
+    hours = (hours * 2).ceil / 2.0 # round up to half hour
+  end
+  db.execute('insert into timesheet ("date", week, subject, project, hours) values (?, ?, ?, ?, ?)', [appt.start.to_date.to_s, week, appt.subject, appt.categories.first, hours])
+}
+
+incomplete = {}
+db.execute('select week, sum(hours) as week_total from timesheet group by week order by week'){|row| row = Hashie::Mash.new(row)
+  next if row.week_total >= 40
+  incomplete[row.week] = row.week_total
+}
+if !incomplete.empty?
+  incomplete.each_pair{|week, hours|
+    puts "#{week}: #{hours}"
+    db.execute('select "date", sum(hours) as day_total from timesheet where week = ? group by "date" order by "date"', week).each{|row| row = Hashie::Mash.new(row)
+      puts row.inspect
+    }
+  }
+  exit
+end
+
+config = File.join(File.dirname(__FILE__), ".timesheet.json")
+session = GoogleDrive::Session.from_config(config)
+sheet = session.spreadsheet_by_key(ENV['TIMESHEET_ID'])
+
+db.execute('select distinct week from timesheet order by week'){|week| week = Hashie::Mash.new(week)
+  puts "#{week.week}..."
+  title = week.week.split('-').reverse.join('-')
+  ws = sheet.worksheet_by_title(title) || sheet.add_worksheet(title)
+
+  db.execute('select distinct "date" from timesheet where week = ? order by "date"', week.week){|row| row = Hashie::Mash.new(row)
+    date = Date.parse(row.date)
+    ws[1, date.wday == 0 ? 8 : date.wday + 1] = date.strftime("'%a %-d-%-m")
+  }
+
+  ws.delete_rows(2, ws.rows.length)
+  projects = {}
+  db.execute('select "date", project, sum(hours) as day_total from timesheet where week = ? group by "date", project order by project, "date"', week.week){|row| row = Hashie::Mash.new(row)
+    if projects[row.project].nil?
+      projects[row.project] = projects.length + 2
+      ws[projects[row.project], 1] = row.project
+    end
+    date = Date.parse(row.date)
+    ws[projects[row.project], date.wday == 0 ? 8 : date.wday + 1] = row.day_total
+  }
+
+  puts ws.title
+  ws.save
+}
