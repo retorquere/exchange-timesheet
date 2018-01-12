@@ -6,7 +6,7 @@ GEM
     declarative (0.0.9)
     declarative-option (0.1.0)
     dotenv (2.2.1)
-    faraday (0.12.1)
+    faraday (0.12.2)
       multipart-post (>= 1.2, < 3)
     google-api-client (0.12.0)
       addressable (~> 2.5, >= 2.5.1)
@@ -19,15 +19,15 @@ GEM
       google-api-client (>= 0.11.0, < 0.13.0)
       googleauth (>= 0.5.0, < 1.0.0)
       nokogiri (>= 1.5.3, < 2.0.0)
-    googleauth (0.5.1)
-      faraday (~> 0.9)
+    googleauth (0.5.3)
+      faraday (~> 0.12)
       jwt (~> 1.4)
       logging (~> 2.0)
       memoist (~> 0.12)
       multi_json (~> 1.11)
       os (~> 0.9)
       signet (~> 0.7)
-    hashie (3.5.5)
+    hashie (3.5.6)
     httpclient (2.8.3)
     jwt (1.5.6)
     little-plugger (1.1.4)
@@ -49,7 +49,7 @@ GEM
       declarative (< 0.1.0)
       declarative-option (< 0.2.0)
       uber (< 0.2.0)
-    retriable (3.0.2)
+    retriable (3.1.1)
     rubyntlm (0.6.2)
     signet (0.7.3)
       addressable (~> 2.3)
@@ -79,4 +79,4 @@ DEPENDENCIES
   viewpoint
 
 BUNDLED WITH
-   1.15.1
+   1.15.3

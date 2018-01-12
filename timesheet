@@ -9,8 +9,30 @@ require 'google_drive'
 require 'json'
 require 'sqlite3'
 require 'hashie'
+require 'csv'
 
 Dotenv.load(File.join(File.dirname(__FILE__), '.env'))
+
+PROJECTS = {}
+PA = {}
+CSV.foreach("projects.csv") do |row|
+  code = row.shift
+  name = row.shift.strip.sub(/\s+p200$/, '')
+  rate = row.shift
+
+  PROJECTS[name] = Hashie::Mash.new({
+    project: code,
+    rate: rate
+  })
+  row.each{|al|
+    raise "Duplicate alias #{al}" if PA[al]
+    PA[al] = name
+  }
+end
+PA.each_pair{|al, project|
+  raise "alias #{al} for existing project #{project}" if PROJECTS[al]
+  PROJECTS[al] = PROJECTS[project]
+}
 
 class Appointment
   @@tz = TZInfo::Timezone.get('Europe/Amsterdam')
@@ -50,7 +72,7 @@ class Calendar
     calendar_view = {
       max_entries_returned: 5000,
       start_date: @start_date.to_time.iso8601,
-      end_date: Date.today.to_time.iso8601,
+      end_date: (Date.today + 7).to_time.iso8601,
     }
     shallow_items = @calendar.items(item_shape: { base_shape: 'IdOnly' }, calendar_view: calendar_view)
     item_ids = shallow_items.map(&:id)
@@ -97,16 +119,20 @@ db.execute('create table timesheet ("date" not null, week not null, subject not 
 monday = Date.today
 case monday.wday
   when 1 then # pass
+  when 6
+    monday += 2
   when 0
     monday += 1
   else
     monday -= (monday.wday - 1)
 end
-Calendar.new.each{|appt|
+monday += 7 ## REMOVE!
+Calendar.new(Date.new(2017, 9, 1)).each{|appt|
   next if appt.status == :Free
   break if appt.start.to_date >= monday
 
-  raise "#{appt.start}: #{appt.subject} == #{appt.categories.inspect}" if appt.categories.length != 1
+  raise "#{appt.start}: #{appt.subject} has categories #{appt.categories.inspect}" if appt.categories.length != 1
+  next if appt.categories.first == 'uncatalogued'
 
   week = DateTime.new(appt.start.year, appt.start.month, appt.start.day)
   week = Date.commercial(week.year, week.cweek, 1).strftime("%Y-%m-%d")
@@ -127,8 +153,8 @@ db.execute('select week, sum(hours) as week_total from timesheet group by week o
 if !incomplete.empty?
   incomplete.each_pair{|week, hours|
     puts "#{week}: #{hours}"
-    db.execute('select "date", sum(hours) as day_total from timesheet where week = ? group by "date" order by "date"', week).each{|row| row = Hashie::Mash.new(row)
-      puts row.inspect
+    db.execute('select "date", sum(hours) as day_total from timesheet where week = ? group by "date" order by "date"', week).each{|row| # row = Hashie::Mash.new(row)
+      puts '  ' + row.inspect
     }
   }
   exit
@@ -143,20 +169,30 @@ db.execute('select distinct week from timesheet order by week'){|week| week = Ha
   title = week.week.split('-').reverse.join('-')
   ws = sheet.worksheet_by_title(title) || sheet.add_worksheet(title)
 
-  db.execute('select distinct "date" from timesheet where week = ? order by "date"', week.week){|row| row = Hashie::Mash.new(row)
-    date = Date.parse(row.date)
-    ws[1, date.wday == 0 ? 8 : date.wday + 1] = date.strftime("'%a %-d-%-m")
+  ws.rows.each_with_index{|row, rownum|
+    row.each_with_index{|cell, colnum|
+      ws[rownum + 1, colnum + 1] = nil
+    }
   }
 
-  ws.delete_rows(2, ws.rows.length)
+  db.execute('select distinct "date" from timesheet where week = ? order by "date"', week.week){|row| row = Hashie::Mash.new(row)
+    date = Date.parse(row.date)
+    ws[1, date.wday == 0 ? 8 : date.wday + 3] = date.strftime("'%a %-d-%-m")
+  }
+
+  #ws.delete_rows(2, ws.rows.length) if ws.rows.length > 2
   projects = {}
   db.execute('select "date", project, sum(hours) as day_total from timesheet where week = ? group by "date", project order by project, "date"', week.week){|row| row = Hashie::Mash.new(row)
+    throw "#{row.project.inspect} not in projects.csv" unless PROJECTS[row.project]
+    throw "#{row.project.inspect} has no rate in projects.csv" unless PROJECTS[row.project].rate
     if projects[row.project].nil?
       projects[row.project] = projects.length + 2
       ws[projects[row.project], 1] = row.project
+      ws[projects[row.project], 2] = PROJECTS[row.project].project
+      ws[projects[row.project], 3] = PROJECTS[row.project].rate
     end
     date = Date.parse(row.date)
-    ws[projects[row.project], date.wday == 0 ? 8 : date.wday + 1] = row.day_total
+    ws[projects[row.project], date.wday == 0 ? 8 : date.wday + 3] = row.day_total
   }
 
   puts ws.title
